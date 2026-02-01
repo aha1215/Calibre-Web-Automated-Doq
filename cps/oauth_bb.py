@@ -33,7 +33,12 @@ Usage:
 
 import json
 import requests
+import os
 from functools import wraps
+
+# Relax OAuthlib scope validation to prevent errors when providers return different scopes
+# This fixes Issue #715 where missing 'groups' scope causes 500 Internal Server Error
+os.environ['OAUTHLIB_RELAX_TOKEN_SCOPE'] = '1'
 
 from flask import session, request, make_response, abort
 from flask import Blueprint, flash, redirect, url_for
@@ -54,7 +59,7 @@ except NameError:
     pass
 
 # Custom OAuth2Session for generic OIDC to handle SSL and scope validation (Issue #715)
-from requests_oauthlib import OAuth2Session as BaseOAuth2Session
+from flask_dance.consumer.requests import OAuth2Session as BaseOAuth2Session
 
 class GenericOIDCSession(BaseOAuth2Session):
     """
@@ -64,8 +69,10 @@ class GenericOIDCSession(BaseOAuth2Session):
     1. SSL verification based on OAUTH_SSL_STRICT setting
     2. Lenient scope validation (order-independent comparison)
     3. Normalizes scope in token response to prevent mismatch warnings
+    4. Explicit token usage without blueprint (Issue #715)
     """
     def __init__(self, *args, **kwargs):
+        self._explicit_token = kwargs.get('token')
         super().__init__(*args, **kwargs)
         # Configure SSL verification for all requests
         self.verify = constants.OAUTH_SSL_STRICT
@@ -73,6 +80,40 @@ class GenericOIDCSession(BaseOAuth2Session):
         # Register compliance hook to normalize scope in token response (Issue #715)
         # This prevents "scope_changed" warnings when Authentik returns scopes in different order
         self.register_compliance_hook('access_token_response', self._normalize_token_scope)
+
+    @property
+    def token(self):
+        """
+        Override token property to support explicit token usage without blueprint.
+        Flask-Dance's token property crashes if blueprint is None.
+        """
+        if self._explicit_token:
+            return self._explicit_token
+        if hasattr(self, 'blueprint') and self.blueprint:
+            return self.blueprint.token
+        return None
+
+    @token.setter
+    def token(self, value):
+        """
+        Allow setting token (required for token refresh/update).
+        This mimics cached_property behavior by shadowing the blueprint token.
+        """
+        self._explicit_token = value
+
+    @token.deleter
+    def token(self):
+        """
+        Handle deletion of token.
+        Flask-Dance deletes the token in __init__ to ensure it uses the blueprint's token.
+        We want to preserve our explicit token if it was passed, so we do nothing here
+        if we are in explicit mode.
+        """
+        # If we are not in explicit mode, we might want to clear something?
+        # But since we store everything in _explicit_token or delegate to blueprint,
+        # and _explicit_token is what we want to keep, we can just ignore the delete
+        # if it's coming from Flask-Dance's init.
+        pass
     
     def _normalize_token_scope(self, response):
         """
@@ -111,6 +152,14 @@ class GenericOIDCSession(BaseOAuth2Session):
         """Override request to ensure SSL verification is applied"""
         if 'verify' not in kwargs:
             kwargs['verify'] = self.verify
+            
+        # If we have an explicit token and no blueprint, we need to handle request manually
+        # to avoid Flask-Dance's dependency on blueprint
+        if self._explicit_token and not self.blueprint:
+            # Bypass Flask-Dance's request method which requires blueprint
+            # Call requests_oauthlib.OAuth2Session.request directly
+            return super(BaseOAuth2Session, self).request(method, url, *args, **kwargs)
+            
         return super().request(method, url, *args, **kwargs)
 
 
@@ -181,12 +230,22 @@ def fetch_metadata_from_url(metadata_url):
         return None
 
 
-def register_user_from_generic_oauth():
+def register_user_from_generic_oauth(token=None):
     generic = oauthblueprints[2]
     blueprint = generic['blueprint']
 
     try:
-        resp = blueprint.session.get(generic['oauth_userinfo_url'], verify=constants.OAUTH_SSL_STRICT)
+        if token:
+            # Use the provided token directly to avoid race conditions with DB storage
+            # This ensures we use the fresh token even if it hasn't been committed to DB yet
+            client_id = generic['oauth_client_id']
+            # Use GenericOIDCSession to maintain SSL/Scope handling logic
+            oauth_session = GenericOIDCSession(client_id=client_id, token=token)
+        else:
+            # Fallback to blueprint session (loads from DB)
+            oauth_session = blueprint.session
+
+        resp = oauth_session.get(generic['oauth_userinfo_url'], verify=constants.OAUTH_SSL_STRICT)
         resp.raise_for_status()
         userinfo = resp.json()
     except InvalidGrantError as e:
@@ -235,11 +294,35 @@ def register_user_from_generic_oauth():
 
     provider_username = str(provider_username)
     provider_user_id = str(provider_user_id)
+    provider_email = userinfo.get(email_field)
+    if provider_email is not None:
+        provider_email = str(provider_email)
 
-    user = (
-        ub.session.query(ub.User)
-        .filter(ub.User.name == provider_username)
-    ).first()
+    is_linking = (
+        current_user and current_user.is_authenticated and
+        session.get('oauth_linking_provider') == str(generic['id'])
+    )
+
+    user = None
+    if is_linking:
+        if provider_email:
+            existing_email_user = (
+                ub.session.query(ub.User)
+                .filter(ub.User.email == provider_email)
+            ).first()
+            if existing_email_user and existing_email_user.id != current_user.id:
+                log.warning("OAuth link rejected: email '%s' already belongs to user '%s'", 
+                            provider_email, existing_email_user.name)
+                flash(_("Failed to link OAuth account. Please try again."), category="error")
+                session.pop('oauth_linking_provider', None)
+                session.modified = True
+                return redirect(url_for('web.profile'))
+        user = current_user
+    else:
+        user = (
+            ub.session.query(ub.User)
+            .filter(ub.User.name == provider_username)
+        ).first()
 
     # Check if user should have admin role based on group membership
     # Handle various group formats: list, string, or None
@@ -263,12 +346,16 @@ def register_user_from_generic_oauth():
         # Apply default configuration settings for new OAuth users (Issue #660)
         # Match the same pattern as normal user creation in admin.py
         
-        # Set role: admin group overrides default role, otherwise use configured default
-        if should_be_admin:
+        # Set role: admin group overrides default role (only if group management enabled), otherwise use configured default
+        if should_be_admin and config.config_enable_oauth_group_admin_management:
             user.role = constants.ROLE_ADMIN
-            log.info("New OAuth user '%s' granted admin role via group '%s'", provider_username, admin_group)
+            log.info("New OAuth user '%s' granted admin role via group '%s' (groups: %s)", 
+                    provider_username, admin_group, user_groups)
         else:
             user.role = config.config_default_role
+            if should_be_admin and not config.config_enable_oauth_group_admin_management:
+                log.debug("New OAuth user '%s' not granted admin role - group-based management disabled", 
+                         provider_username)
         
         # Apply default user settings (same as normal user registration)
         user.sidebar_view = getattr(config, 'config_default_show', 1)
@@ -301,16 +388,23 @@ def register_user_from_generic_oauth():
     else:
         # Existing user: update admin role based on current group membership (Issue #715)
         # This ensures that users who are added to or removed from admin groups get proper access
+        # Only enforce if group-based admin management is enabled (global setting)
         current_is_admin = user.role_admin()
         
-        if should_be_admin and not current_is_admin:
-            # User was added to admin group - grant admin role
-            user.role |= constants.ROLE_ADMIN
-            log.info("OAuth user '%s' will be granted admin role via group '%s'", provider_username, admin_group)
-        elif not should_be_admin and current_is_admin:
-            # User was removed from admin group - revoke admin role (but keep other roles)
-            user.role &= ~constants.ROLE_ADMIN
-            log.info("OAuth user '%s' admin role will be revoked (not in group '%s')", provider_username, admin_group)
+        if config.config_enable_oauth_group_admin_management:
+            if should_be_admin and not current_is_admin:
+                # User was added to admin group - grant admin role
+                user.role |= constants.ROLE_ADMIN
+                log.info("OAuth user '%s' granted admin role via group '%s' (groups: %s)", 
+                        provider_username, admin_group, user_groups)
+            elif not should_be_admin and current_is_admin:
+                # User was removed from admin group - revoke admin role (but keep other roles)
+                user.role &= ~constants.ROLE_ADMIN
+                log.warning("OAuth user '%s' admin role revoked - not in required group '%s' (user groups: %s)", 
+                           provider_username, admin_group, user_groups)
+        else:
+            log.debug("OAuth group-based admin management disabled - preserving manual role assignments for '%s'", 
+                     provider_username)
         # Note: Changes are not committed yet - will be committed with OAuth entry below
 
     oauth = ub.session.query(ub.OAuth).filter_by(
@@ -328,18 +422,46 @@ def register_user_from_generic_oauth():
 
     oauth.user = user
     
-    # Commit all changes together: OAuth entry + any role updates
+    # Atomic Token Update: If we have a fresh token, save it NOW in the same transaction
+    if token:
+        oauth.token = token
+
+    # Commit all changes together: OAuth entry + Token + User + Role updates
     try:
         ub.session_commit()
-        # Log role changes after successful commit
-        if user.role_admin() and should_be_admin:
+        # Log role changes after successful commit (only if group management is enabled)
+        if user.role_admin() and should_be_admin and config.config_enable_oauth_group_admin_management:
             log.info("OAuth user '%s' has admin role via group '%s'", provider_username, admin_group)
     except Exception as ex:
         log.error("Failed to save OAuth session for user '%s': %s", provider_username, ex)
         ub.session.rollback()
         return None
 
-    return provider_user_id
+    # ATOMIC SESSION CLEANUP
+    # We must clean the session triggers to avoid "Cookie Too Large" errors (4KB limit).
+    # Since we just saved the token to the DB, it is safe to remove it from the session.
+    if token:
+        provider_id = str(generic['id'])
+        keys_to_remove = [
+            'google_oauth_token', 'github_oauth_token', 'generic_oauth_token',
+            provider_id + "_oauth_token"
+        ]
+        for key in keys_to_remove:
+            if key in session:
+                try:
+                    session.pop(key)
+                except Exception as e:
+                    log.warning(f"Failed to clean session key '{key}': {e}")
+        # We assume the user is about to be logged in by bind_oauth_or_register, 
+        # but we set the user_id in session just in case, matching oauth_update_token behavior.
+        session[provider_id + "_oauth_user_id"] = provider_user_id
+        session.modified = True
+
+    # DIRECT LOGIN: Return the response from binding/login (redirect)
+    # This aligns with the "Atomic" strategy to prevent loops
+    session.pop('oauth_linking_provider', None)
+    session.modified = True
+    return bind_oauth_or_register(str(generic['id']), provider_user_id, 'generic.login', 'generic')
 
 
 def logout_oauth_user():
@@ -351,8 +473,27 @@ def logout_oauth_user():
 
 
 def oauth_update_token(provider_id, token, provider_user_id):
+
+
+    # Aggressively clean up potential duplicate tokens to prevent cookie overflow (4KB limit)
+    # We remove ALL token data from session and rely on DB storage
+    keys_to_remove = [
+        'google_oauth_token', 'github_oauth_token', 'generic_oauth_token',
+        provider_id + "_oauth_token"
+    ]
+    for key in keys_to_remove:
+        if key in session:
+            try:
+                session.pop(key)
+            except Exception as e:
+                log.warning(f"Failed to clean session key '{key}': {e}")
+
     session[provider_id + "_oauth_user_id"] = provider_user_id
-    session[provider_id + "_oauth_token"] = token
+    # Do NOT store token in session - it's too big and causes cookie drop
+    # session[provider_id + "_oauth_token"] = token 
+    session.modified = True
+
+
 
     # Find this OAuth token in the database, or create it
     query = ub.session.query(ub.OAuth).filter_by(
@@ -479,19 +620,29 @@ def generate_oauth_blueprints():
             ub.session_commit("{} Blueprint Created".format(provider))
 
     oauth_ids = ub.session.query(ub.OAuthProvider).filter(ub.OAuthProvider.provider_name.in_(['github', 'google'])).all()
+    
+    # Ensure deterministic assignment of providers regardless of DB query order
+    github_provider = next((p for p in oauth_ids if p.provider_name == 'github'), None)
+    google_provider = next((p for p in oauth_ids if p.provider_name == 'google'), None)
+    
+    # Fallback if providers are missing (shouldn't happen due to creation logic above)
+    if not github_provider or not google_provider:
+        log.error("OAuth providers missing after creation check")
+        return []
+
     ele1 = dict(provider_name='github',
-                id=oauth_ids[0].id,
-                active=oauth_ids[0].active,
-                oauth_client_id=oauth_ids[0].oauth_client_id,
+                id=github_provider.id,
+                active=github_provider.active,
+                oauth_client_id=github_provider.oauth_client_id,
                 scope=None,
-                oauth_client_secret=oauth_ids[0].oauth_client_secret,
+                oauth_client_secret=github_provider.oauth_client_secret,
                 obtain_link='https://github.com/settings/developers')
     ele2 = dict(provider_name='google',
-                id=oauth_ids[1].id,
-                active=oauth_ids[1].active,
+                id=google_provider.id,
+                active=google_provider.active,
                 scope=["https://www.googleapis.com/auth/userinfo.email"],
-                oauth_client_id=oauth_ids[1].oauth_client_id,
-                oauth_client_secret=oauth_ids[1].oauth_client_secret,
+                oauth_client_id=google_provider.oauth_client_id,
+                oauth_client_secret=google_provider.oauth_client_secret,
                 obtain_link='https://console.developers.google.com/apis/credentials')
     oauthblueprints.append(ele1)
     oauthblueprints.append(ele2)
@@ -640,7 +791,21 @@ def generate_oauth_blueprints():
     return oauthblueprints
 
 
-if ub.oauth_support:
+def init_oauth_blueprints():
+    """
+    Initialize OAuth blueprints and register signal handlers.
+    
+    This function MUST be called after babel.init_app() in __init__.py to ensure
+    translations are properly loaded. When OAuth blueprints are generated during
+    module import (before babel init), babel.list_translations() returns an empty
+    list, causing the language selection dropdown to only show English.
+    
+    Issue: https://discord.com/channels/.../... (BortS 01/01/2026)
+    """
+    if not ub.oauth_support:
+        return []
+    
+    global oauthblueprints
     oauthblueprints = generate_oauth_blueprints()
 
     @oauth_authorized.connect_via(oauthblueprints[0]['blueprint'])
@@ -658,7 +823,16 @@ if ub.oauth_support:
 
         github_info = resp.json()
         github_user_id = str(github_info["id"])
-        return oauth_update_token(str(oauthblueprints[0]['id']), token, github_user_id)
+        
+        # Save token to DB
+        oauth_update_token(str(oauthblueprints[0]['id']), token, github_user_id)
+        
+        # DIRECT LOGIN: Hijack flow to prevent redirect loop
+        response = bind_oauth_or_register(oauthblueprints[0]['id'], github_user_id, 'github.login', 'github')
+        if response:
+            abort(response)
+            
+        return False
 
 
     @oauth_authorized.connect_via(oauthblueprints[1]['blueprint'])
@@ -668,6 +842,9 @@ if ub.oauth_support:
             log.error("Failed to log in with Google")
             return False
 
+        # We do NOT store token in session["google_oauth_token"] here to avoid duplication/bloat.
+        # It will be stored in session[provider_id + "_oauth_token"] by oauth_update_token.
+
         resp = blueprint.session.get("/oauth2/v2/userinfo")
         if not resp.ok:
             flash(_("Failed to fetch user info from Google."), category="error")
@@ -676,7 +853,20 @@ if ub.oauth_support:
 
         google_info = resp.json()
         google_user_id = str(google_info["id"])
-        return oauth_update_token(str(oauthblueprints[1]['id']), token, google_user_id)
+        
+        # Save token to DB
+        oauth_update_token(str(oauthblueprints[1]['id']), token, google_user_id)
+        
+        # DIRECT LOGIN: Hijack flow to prevent redirect loop
+        # We perform the binding/login logic right here
+        response = bind_oauth_or_register(oauthblueprints[1]['id'], google_user_id, 'google.login', 'google')
+        
+        # If we got a response (redirect), abort the current request and send it immediately
+        # This stops Flask-Dance from doing its own redirect to /link/google
+        if response:
+            abort(response)
+            
+        return False
 
 
     @oauth_authorized.connect_via(oauthblueprints[2]['blueprint'])
@@ -687,12 +877,15 @@ if ub.oauth_support:
             return False
 
         try:
-            provider_user_id = register_user_from_generic_oauth()
-            if provider_user_id:
-                return oauth_update_token(str(oauthblueprints[2]['id']), token, provider_user_id)
-            else:
-                # register_user_from_generic_oauth already logged error and flashed message
-                return False
+            # Pass token explicitly to avoid DB race condition
+            # FUNCTION NOW RETURNS A RESPONSE OBJECT (Redirect)
+            response = register_user_from_generic_oauth(token)
+            if response:
+                return response
+            
+            # If no response, something failed silently (already logged)
+            return False
+
         except (InvalidGrantError, TokenExpiredError) as e:
             log.error("OAuth token error in generic_logged_in: %s", e)
             flash(_("OAuth authentication failed: Token validation error. Please try again."), category="error")
@@ -758,10 +951,20 @@ if ub.oauth_support:
         flash(msg, category="error")
         log.error("Generic OAuth error: %s", msg)
 
+    return oauthblueprints
+
+
+# Initialize empty oauthblueprints list at module level
+# This will be populated when init_oauth_blueprints() is called
+oauthblueprints = []
+
 
 @oauth.route('/link/github')
 @oauth_required
 def github_login():
+    # This route is now only a fallback if the direct login hijack fails
+    # or if the user navigates here manually.
+    log.warning("Fallback OAuth route '/link/github' accessed - direct login may have failed")
     if not github.authorized:
         return redirect(url_for('github.login'))
     try:
@@ -772,8 +975,13 @@ def github_login():
         flash(_("GitHub Oauth error, please retry later."), category="error")
         log.error("GitHub Oauth error, please retry later")
     except (InvalidGrantError, TokenExpiredError) as e:
+        try:
+            del github.token
+        except Exception:
+            pass
         flash(_("GitHub Oauth error: {}").format(e), category="error")
         log.error(e)
+        return redirect(url_for('github.login'))
     return redirect(url_for('web.login'))
 
 
@@ -786,18 +994,54 @@ def github_login_unlink():
 @oauth.route('/link/google')
 @oauth_required
 def google_login():
+    log.warning("Fallback OAuth route '/link/google' accessed - direct login may have failed")
+    # Try to find token in session using the provider ID key
+    provider_id = str(oauthblueprints[1]['id'])
+    user_id_key = provider_id + "_oauth_user_id"
+    
+    # 1. Try to get User ID from session (Small cookie!)
+    if user_id_key in session:
+        provider_user_id = session[user_id_key]
+        
+        # 2. Fetch the huge token from Database instead of session
+        oauth_entry = ub.session.query(ub.OAuth).filter_by(
+            provider=provider_id,
+            provider_user_id=provider_user_id
+        ).first()
+        
+        if oauth_entry and oauth_entry.token:
+            # 3. Manually inject token into blueprint
+            google.token = oauth_entry.token
+            
+            # 4. Proceed directly to login
+            return bind_oauth_or_register(oauthblueprints[1]['id'], provider_user_id, 'google.login', 'google')
+
     if not google.authorized:
         return redirect(url_for("google.login"))
+    
     try:
+        # If google.authorized is False but we have a token, google.get might fail
+        # We can try to use the token directly with requests if needed, but let's try google.get first
+        # If google.token was set, google.get should use it
+        
         resp = google.get("/oauth2/v2/userinfo")
         if resp.ok:
             account_info_json = resp.json()
             return bind_oauth_or_register(oauthblueprints[1]['id'], account_info_json['id'], 'google.login', 'google')
+        
         flash(_("Google Oauth error, please retry later."), category="error")
         log.error("Google Oauth error, please retry later")
     except (InvalidGrantError, TokenExpiredError) as e:
+        try:
+            del google.token
+        except Exception:
+            pass
         flash(_("Google Oauth error: {}").format(e), category="error")
         log.error(e)
+        return redirect(url_for("google.login"))
+    except Exception as e:
+        log.error(f"Unexpected error: {e}")
+        
     return redirect(url_for('web.login'))
 
 
@@ -810,18 +1054,35 @@ def google_login_unlink():
 @oauth.route('/link/generic')
 @oauth_required
 def generic_login():
+    log.warning("Fallback OAuth route '/link/generic' accessed - direct login may have failed")
+    # This route is now only a fallback if the direct login hijack fails
+    # or if the user navigates here manually.
+    if current_user and current_user.is_authenticated:
+        session['oauth_linking_provider'] = str(oauthblueprints[2]['id'])
+        session.modified = True
     if not oauthblueprints[2]['blueprint'].session.authorized:
         return redirect(url_for("generic.login"))
     try:
-        provider_user_id = register_user_from_generic_oauth()
-        return bind_oauth_or_register(oauthblueprints[2]['id'], provider_user_id, 'generic.login', 'generic')
+        # Here we rely on the stored token since we don't have it in args
+        # If the previous step (generic_logged_in) succeeded, the token is in DB
+        # This function now returns a Response object (redirect)
+        return register_user_from_generic_oauth()
     except (TokenExpiredError) as e:
+        try:
+            del oauthblueprints[2]['blueprint'].token
+        except Exception:
+            pass
         flash(_("OAuth error: {}").format(e), category="error")
         log.error(e)
         return redirect(url_for("generic.login"))
     except (InvalidGrantError) as e:
+        try:
+            del oauthblueprints[2]['blueprint'].token
+        except Exception:
+            pass
         flash(_("OAuth error: {}").format(e), category="error")
         log.error(e)
+        return redirect(url_for("generic.login"))
     return redirect(url_for("web.login"))
 
 

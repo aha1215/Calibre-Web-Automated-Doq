@@ -356,6 +356,11 @@ form#archived_form > label.block-label::before {
     z-index: -1 !important;
 }
 
+/* Fixes Create Magic Shelf spacing in sidebar */
+li#nav_createmagicshelf {
+    margin-left: 1rem !important;
+}
+
 /* Fixes close buttons colour */
 button.close > span {
     color: whitesmoke;
@@ -394,4 +399,21 @@ a#advanced_search > span.hidden-sm {
 
 .btn-primary[disabled] {
     background-color: var(--color-secondary);
+}
+/* Fix for disabled theme switcher tooltip text overflow */
+.tooltip.cwa-tooltip-wrap .tooltip-inner {
+    white-space: normal !important;
+    max-width: 250px !important;
+    width: auto !important;
+    text-align: center;
+}
+
+.cwa-settings-tip {
+    margin-top: 1rem;
+    padding: 0.5rem;
+    background-color: rgba(255, 193, 7, 0.1);
+    border-left: 4px solid #ffc107;
+    border-radius: 0.25rem;
+    margin-bottom: 2rem;
+    padding-left: 2rem;
 }

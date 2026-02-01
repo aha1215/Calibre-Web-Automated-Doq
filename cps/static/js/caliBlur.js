@@ -504,7 +504,7 @@ $(".plexBack > a").attr({
 
 $("#cwa-switch-theme").attr({
     "data-toggle": "tooltip",
-    "title": $("#cwa-switch-theme").text(),              // "Switch Theme"
+    "title": $("#cwa-switch-theme").attr("title") || $("#cwa-switch-theme").text(),  // Use existing title attribute or fallback to text
     "data-placement": "bottom",
     "data-viewport": "#main-nav"
 })
@@ -680,6 +680,14 @@ if ($("body.epub").length === 0) {
         $("[data-toggle='tooltip']").tooltip({container: "body", trigger: "hover"});
         $("[data-toggle-two='tooltip']").tooltip({container: "body", trigger: "hover"});
         $("#btn-upload").attr("title", " ");
+        
+        // Ensure disabled theme switcher button has properly styled Bootstrap tooltip
+        $("#cwa-switch-theme").tooltip('destroy').tooltip({
+            container: "body", 
+            trigger: "hover",
+            placement: "bottom",
+            template: '<div class="tooltip cwa-tooltip-wrap" role="tooltip"><div class="tooltip-arrow"></div><div class="tooltip-inner"></div></div>'
+        });
     });
 
 
@@ -1026,7 +1034,7 @@ $(function() {
             }
             
             if (selectedFormat) {
-                window.open('/read/' + bookId + '/' + selectedFormat, '_blank');
+                window.open(window.scriptRoot + '/read/' + bookId + '/' + selectedFormat, '_blank');
             } else {
                 window.location.href = $link.attr('href');
             }
@@ -1050,8 +1058,11 @@ $(function() {
         var isCurrentlyRead = $readBadge.length > 0;
         
         $.ajax({
-            url: '/ajax/toggleread/' + bookId,
+            url: window.scriptRoot + '/ajax/toggleread/' + bookId,
             type: 'POST',
+            data: {
+                csrf_token: $("input[name='csrf_token']").val()
+            },
             headers: {
                 'X-Requested-With': 'XMLHttpRequest'
             },
@@ -1154,7 +1165,7 @@ $(function() {
         
         // Use /send_selected endpoint but only send to primary email
         $.ajax({
-            url: '/send_selected/' + bookId,
+            url: window.scriptRoot + '/send_selected/' + bookId,
             type: 'POST',
             headers: {
                 'X-Requested-With': 'XMLHttpRequest'
@@ -1215,7 +1226,7 @@ $(function() {
         }
         
         // Navigate to the edit page in the same tab
-        var editUrl = '/admin/book/' + bookId;
+        var editUrl = window.scriptRoot + '/admin/book/' + bookId;
         window.location.href = editUrl;
     }
     

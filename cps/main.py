@@ -9,7 +9,7 @@ import sys
 
 from . import create_app, limiter
 from .jinjia import jinjia
-from flask import request
+from flask import request, g
 
 
 def request_username():
@@ -32,11 +32,12 @@ def main():
     from .tasks_status import tasks
     from .error_handler import init_errorhandler
     from .remotelogin import remotelogin
-    from .kosync import kosync
+    from .progress_syncing.protocols.kosync import kosync
     from .duplicates import duplicates
     try:
         from .kobo import kobo, get_kobo_activated
         from .kobo_auth import kobo_auth
+        from .readingservices import readingservices_api_v3, readingservices_userstorage
         from flask_limiter.util import get_remote_address
         kobo_available = get_kobo_activated()
     except (ImportError, AttributeError):  # Catch also error for not installed flask-WTF (missing csrf decorator)
@@ -52,6 +53,7 @@ def main():
 
     from . import web_server
     init_errorhandler()
+
 
     # CWA Blueprints
     app.register_blueprint(switch_theme)
@@ -85,6 +87,8 @@ def main():
         app.register_blueprint(kobo)
         app.register_blueprint(kobo_auth)
         limiter.limit("3/minute", key_func=get_remote_address)(kobo)
+        app.register_blueprint(readingservices_api_v3)
+        app.register_blueprint(readingservices_userstorage)
     if oauth_available:
         app.register_blueprint(oauth)
     success = web_server.start()

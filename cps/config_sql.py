@@ -86,8 +86,14 @@ class _Settings(_Base):
     config_anonbrowse = Column(SmallInteger, default=0)
     config_public_reg = Column(SmallInteger, default=0)
     config_remote_login = Column(Boolean, default=False)
+    config_use_https = Column(Boolean, default=False)
     config_kobo_sync = Column(Boolean, default=False)
-    config_hardcover_sync = Column(Boolean, default=False)
+    config_kobo_sync_magic_shelves = Column(Boolean, default=False)
+
+    # Sync read progress to Hardcover - should this be renamed?
+    config_hardcover_sync = Column(Boolean, default=False) 
+    # Sync annotations to Hardcover
+    config_hardcover_annotations_sync = Column(Boolean, default=False)
 
     config_default_role = Column(SmallInteger, default=0)
     config_default_show = Column(SmallInteger, default=constants.ADMIN_USER_SIDEBAR)
@@ -148,6 +154,8 @@ class _Settings(_Base):
     config_reverse_proxy_auto_create_users = Column(Boolean, default=False)
     config_ldap_auto_create_users = Column(Boolean, default=True)
     config_oauth_redirect_host = Column(String, default='')
+    config_disable_standard_login = Column(Boolean, default=False)
+    config_enable_oauth_group_admin_management = Column(Boolean, default=True)
 
     schedule_start_time = Column(Integer, default=4)
     schedule_duration = Column(Integer, default=10)
@@ -179,6 +187,7 @@ class ConfigSQL(object):
     # pylint: disable=no-member
     def __init__(self):
         self.__dict__["dirty"] = list()
+        self.cli = None
 
     def init_config(self, session, secret_key, cli):
         self._session = session
@@ -229,21 +238,25 @@ class ConfigSQL(object):
         return self._settings
 
     def get_config_certfile(self):
-        if self.cli.certfilepath:
-            return self.cli.certfilepath
-        if self.cli.certfilepath == "":
-            return None
+        if self.cli:
+            if self.cli.certfilepath:
+                return self.cli.certfilepath
+            if self.cli.certfilepath == "":
+                return None
         return self.config_certfile
 
     def get_config_keyfile(self):
-        if self.cli.keyfilepath:
-            return self.cli.keyfilepath
-        if self.cli.certfilepath == "":
-            return None
+        if self.cli:
+            if self.cli.keyfilepath:
+                return self.cli.keyfilepath
+            if self.cli.certfilepath == "":
+                return None
         return self.config_keyfile
 
     def get_config_ipaddress(self):
-        return self.cli.ip_address or ""
+        if self.cli:
+            return self.cli.ip_address or ""
+        return ""
 
     def _has_role(self, role_flag):
         return constants.has_flag(self.config_default_role, role_flag)

@@ -215,6 +215,10 @@
         <input type="checkbox" id="config_hardcover_sync" name="config_hardcover_sync"  {% if config.config_hardcover_sync %}checked{% endif %}>
         <label for="config_hardcover_sync">{{_('Sync Kobo read progress to Hardcover (Requires API key per user)')}}</label>
       </div>
+      <div class="form-group" style="margin-left:10px;">
+        <input type="checkbox" id="config_hardcover_annotations_sync" name="config_hardcover_annotations_sync"  {% if config.config_hardcover_annotations_sync %}checked{% endif %}>
+        <label for="config_hardcover_annotations_sync">{{_('Sync Kobo annotations to Hardcover (Requires API key per user)')}}</label>
+      </div>
     </div>
     {% endif %}
     {% if feature_support['goodreads'] %}
@@ -242,6 +246,12 @@
     <div class="form-group">
       <input type="checkbox" id="config_allow_reverse_proxy_header_login" name="config_allow_reverse_proxy_header_login" data-control="reverse-proxy-login-settings" {% if config.config_allow_reverse_proxy_header_login %}checked{% endif %}>
       <label for="config_allow_reverse_proxy_header_login">{{_('Allow Reverse Proxy Authentication')}}</label>
+      <div class="help-block">{{_('Trusts the "Remote-User" header from a reverse proxy for authentication. This is an authentication method, distinct from the HTTPS security setting below.')}}</div>
+    </div>
+    <div class="form-group">
+        <input type="checkbox" id="config_use_https" name="config_use_https" {% if config.config_use_https %}checked{% endif %}>
+        <label for="config_use_https">{{_('Use via HTTPS')}}</label>
+        <div class="help-block">{{_('Enables secure cookie settings (Secure, SameSite=Lax). Enable this ONLY if you are accessing the server via HTTPS, otherwise you will be locked out.')}}</div>
     </div>
     <div data-related="reverse-proxy-login-settings">
       <div class="form-group">
@@ -264,7 +274,7 @@
            <option value="1" {% if config.config_login_type == 1 %}selected{% endif %}>{{_('Use LDAP Authentication')}}</option>
            {% endif %}
            {% if feature_support['oauth'] %}
-           <option value="2" {% if config.config_login_type == 2 %}selected{% endif %}>{{_('Use OAuth')}}</option>
+           <option value="2" {% if config.config_login_type == 2 %}selected{% endif %}>{{_('Use OAuth (requires HTTPS)')}}</option>
            {% endif %}
         </select>
       </div>
@@ -377,6 +387,9 @@
       {% endif %}
       {% if feature_support['oauth'] %}
         <div data-related="login-settings-2">
+          <p class="text-danger" style="margin-top: 2rem; background: #ffe9ec; padding: 1rem; border-left: 4px solid #a94442; padding-inline: 2rem; margin-bottom: 2rem;">
+            <strong>{{_('Important:')}}</strong> {{_('OAuth authentication requires this server to be accessed via HTTPS. If you are using HTTP, login will fail.')}}
+          </p>
           {% set generic = provider | selectattr('provider_name', 'equalto', 'generic') | first %}
           <p>{{ _('Generic OAuth Provider') }}</p>
           
@@ -476,6 +489,7 @@
           <div class="form-group">
             <label for="config_generic_oauth_admin_group">{{_('OAuth group for Admin')}}</label>
             <input type="text" class="form-control" id="config_generic_oauth_admin_group" name="config_generic_oauth_admin_group" value="{% if generic['oauth_admin_group'] != None %}{{ generic['oauth_admin_group'] }}{% endif %}" autocomplete="off">
+            <div class="help-block">{{_('Name of the OAuth group that grants admin privileges. Leave empty to disable group-based admin management, or use the global setting in Security Settings for more control.')}}</div>
           </div>
           <div class="form-group">
             <label for="config_generic_oauth_login_button">{{_('Login Button Text')}}</label>
@@ -534,6 +548,16 @@
 
   <div class="settings-container">
     <h4 class="settings-section-header">{{_('Security Settings')}}</h4>
+            <div class="form-group">
+                <input type="checkbox" id="config_disable_standard_login" name="config_disable_standard_login" {% if config.config_disable_standard_login %}checked{% endif %}>
+                <label for="config_disable_standard_login">{{_('Disable Standard Login (Username/Password)')}}</label>
+                <div class="help-block">{{_('Hides the standard login form. Users must log in via OAuth or LDAP. Ensure you have a working alternative login method before enabling.')}}</div>
+            </div>
+            <div class="form-group">
+                <input type="checkbox" id="config_enable_oauth_group_admin_management" name="config_enable_oauth_group_admin_management" {% if config.config_enable_oauth_group_admin_management %}checked{% endif %}>
+                <label for="config_enable_oauth_group_admin_management">{{_('Enable OAuth Group-Based Admin Role Management')}}</label>
+                <div class="help-block">{{_('When enabled, admin privileges are automatically granted or revoked based on OAuth group membership. Disable this to manually manage admin roles in the user management panel, preventing OAuth logins from overriding local role assignments.')}}</div>
+            </div>
             <div class="form-group">
               <input type="checkbox" id="config_ratelimiter" name="config_ratelimiter" {% if config.config_ratelimiter %}checked{% endif %}>
               <label for="config_ratelimiter">{{_('Limit failed login attempts')}}</label>
@@ -602,6 +626,7 @@
 {{ filechooser_modal() }}
 {% endblock %}
 
+{% block js %}
 <script>
 $(document).ready(function() {
   // Check for authentication switching warning
@@ -615,6 +640,19 @@ $(document).ready(function() {
       warningDiv.show();
     } else {
       warningDiv.hide();
+    }
+  });
+
+  // Trigger change on load to set initial state
+  $('#config_login_type').trigger('change');
+  
+  // Warn about potential lockout when disabling standard login without OAuth (Issue #715)
+  $('#config_disable_standard_login').on('change', function() {
+    var isDisabled = $(this).is(':checked');
+    var loginType = $('#config_login_type').val();
+    
+    if (isDisabled && loginType === '0') {
+      alert('Warning: You are about to disable standard login without enabling OAuth or LDAP authentication. This may lock you out of the system. Ensure you have configured and tested an alternative login method before saving.');
     }
   });
 
@@ -712,3 +750,4 @@ $(document).ready(function() {
   });
 });
 </script>
+{% endblock %}
