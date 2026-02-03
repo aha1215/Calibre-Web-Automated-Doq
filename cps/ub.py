@@ -285,6 +285,8 @@ class User(UserBase, Base):
     theme = Column(Integer, default=1)
     # Auto-send settings for new books
     auto_send_enabled = Column(Boolean, default=False)
+    # Allow entering additional email addresses on send-to-eReader
+    allow_additional_ereader_emails = Column(Boolean, default=True)
 
 
 if oauth_support:
@@ -867,6 +869,23 @@ def migrate_user_table(engine, _session):
                 e,
             )
 
+    # Migration for per-user additional eReader email address permission
+    try:
+        _session.query(exists().where(User.allow_additional_ereader_emails)).scalar()
+        _session.commit()
+    except exc.OperationalError:
+        _safe_session_rollback(_session, "user.allow_additional_ereader_emails")
+        try:
+            _run_ddl_with_retry(engine, "ALTER TABLE user ADD column 'allow_additional_ereader_emails' Boolean DEFAULT 1")
+        except Exception as e:
+            db_hint = app_DB_path or str(engine.url)
+            log.error(
+                "Failed to add allow_additional_ereader_emails column to user table in app.db (%s). "
+                "Check file permissions, locks, and CALIBRE_DBPATH mapping. Error: %s",
+                db_hint,
+                e,
+            )
+
     # Migration to add per-user email subject for Kindle sending
     try:
         _session.query(exists().where(User.kindle_mail_subject)).scalar()
@@ -875,19 +894,34 @@ def migrate_user_table(engine, _session):
         _safe_session_rollback(_session, "user.kindle_mail_subject")
         _run_ddl_with_retry(engine, "ALTER TABLE user ADD column 'kindle_mail_subject' String DEFAULT ''")
 
-    # Migration to enable duplicates sidebar for existing admin users
+    # Migration to enable duplicates sidebar for existing admin users (one-time)
     try:
         from . import constants
         SIDEBAR_DUPLICATES = constants.SIDEBAR_DUPLICATES
 
-        # Check if any admin users don't have duplicates enabled
-        admin_users = _session.query(User).filter(User.role.op('&')(constants.ROLE_ADMIN) == constants.ROLE_ADMIN).all()
-        for user in admin_users:
-            if not (user.sidebar_view & SIDEBAR_DUPLICATES):
-                user.sidebar_view |= SIDEBAR_DUPLICATES
-                print(f"[Migration] Enabled duplicates sidebar for admin user: {user.name}")
+        migration_dir = os.path.join(constants.CONFIG_DIR, ".cwa_migrations")
+        migration_marker = os.path.join(migration_dir, "duplicates_sidebar_v1")
 
-        _session.commit()
+        if not os.path.isfile(migration_marker):
+            # Check if any admin users don't have duplicates enabled
+            admin_users = _session.query(User).filter(
+                User.role.op('&')(constants.ROLE_ADMIN) == constants.ROLE_ADMIN
+            ).all()
+            for user in admin_users:
+                if not (user.sidebar_view & SIDEBAR_DUPLICATES):
+                    user.sidebar_view |= SIDEBAR_DUPLICATES
+                    print(f"[Migration] Enabled duplicates sidebar for admin user: {user.name}")
+
+            _session.commit()
+            try:
+                os.makedirs(migration_dir, exist_ok=True)
+                with open(migration_marker, "w", encoding="utf-8") as marker:
+                    marker.write(datetime.now(timezone.utc).isoformat())
+            except Exception as marker_error:
+                print(
+                    f"[Migration] Warning: Could not persist duplicates sidebar migration marker: {marker_error}",
+                    flush=True,
+                )
     except Exception as e:
         print(f"[Migration] Warning: Could not update duplicates sidebar setting: {e}")
         _session.rollback()
