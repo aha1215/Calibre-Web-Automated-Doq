@@ -1999,13 +1999,30 @@ def send_to_selected_ereaders(book_id):
         response = [{'type': "danger", 'message': _("Please configure the SMTP mail settings first...")}]
         return Response(json.dumps(response), mimetype='application/json')
 
-    selected_emails = request.form.get('selected_emails', '')
+    selected_emails_raw = request.form.get('selected_emails', '')
     book_format = request.form.get('book_format', '')
     convert = request.form.get('convert', '0')
+
+    if not selected_emails_raw:
+        response = [{'type': "danger", 'message': _("No email addresses selected")}]
+        return Response(json.dumps(response), mimetype='application/json')
+
+    try:
+        selected_emails = valid_email(selected_emails_raw)
+    except Exception as ex:
+        response = [{'type': "danger", 'message': str(ex)}]
+        return Response(json.dumps(response), mimetype='application/json')
 
     if not selected_emails:
         response = [{'type': "danger", 'message': _("No email addresses selected")}]
         return Response(json.dumps(response), mimetype='application/json')
+
+    if not getattr(current_user, 'allow_additional_ereader_emails', True):
+        allowed = [email.strip().lower() for email in (current_user.kindle_mail or "").split(',') if email.strip()]
+        selected_list = [email.strip().lower() for email in selected_emails.split(',') if email.strip()]
+        if any(email not in allowed for email in selected_list):
+            response = [{'type': "danger", 'message': _("Additional email addresses are disabled for your account.")}]
+            return Response(json.dumps(response), mimetype='application/json')
 
     result = send_mail(book_id, book_format, int(convert), selected_emails, config.get_book_path(), current_user.name, current_user.kindle_mail_subject)
 
@@ -2414,6 +2431,7 @@ def change_profile(kobo_support, hardcover_support, local_oauth_check, oauth_sta
         # Auto-send and metadata fetch settings
         current_user.auto_send_enabled = to_save.get("auto_send_enabled") == "on"
         current_user.auto_metadata_fetch = to_save.get("auto_metadata_fetch") == "on"
+        current_user.allow_additional_ereader_emails = to_save.get("allow_additional_ereader_emails") == "on"
         
         # Handle hidden magic shelf templates and custom shelves
         from . import magic_shelf
@@ -2482,14 +2500,94 @@ def change_profile(kobo_support, hardcover_support, local_oauth_check, oauth_sta
             except Exception:
                 pass
 
+        # OPDS root order
+        opds_order_raw = to_save.get("opds_root_order", "").strip()
+        if opds_order_raw:
+            from .opds import normalize_opds_root_order
+            opds_order_list = [item.strip() for item in opds_order_raw.split(',') if item.strip()]
+            normalized_order = normalize_opds_root_order(opds_order_list)
+            if current_user.view_settings is None:
+                current_user.view_settings = {}
+            current_user.view_settings.setdefault('opds', {})['root_order'] = normalized_order
+            flag_modified(current_user, "view_settings")
+        else:
+            if current_user.view_settings and current_user.view_settings.get('opds', {}).get('root_order'):
+                current_user.view_settings['opds'].pop('root_order', None)
+                if not current_user.view_settings['opds']:
+                    current_user.view_settings.pop('opds', None)
+                flag_modified(current_user, "view_settings")
+
+        # OPDS hidden entries
+        opds_hidden_raw = to_save.get("opds_hidden_entries", "").strip()
+        if opds_hidden_raw:
+            from .opds import OPDS_ROOT_ENTRY_DEFS
+            hidden_entries = [item.strip() for item in opds_hidden_raw.split(',') if item.strip()]
+            hidden_entries = [key for key in hidden_entries if key in OPDS_ROOT_ENTRY_DEFS]
+            if current_user.view_settings is None:
+                current_user.view_settings = {}
+            current_user.view_settings.setdefault('opds', {})['hidden_entries'] = hidden_entries
+            flag_modified(current_user, "view_settings")
+        else:
+            if current_user.view_settings and current_user.view_settings.get('opds', {}).get('hidden_entries'):
+                current_user.view_settings['opds'].pop('hidden_entries', None)
+                if not current_user.view_settings['opds']:
+                    current_user.view_settings.pop('opds', None)
+                flag_modified(current_user, "view_settings")
+
     except Exception as ex:
         flash(str(ex), category="error")
+        from . import magic_shelf
+        system_shelf_templates = magic_shelf.SYSTEM_SHELF_TEMPLATES
+        hidden_items = ub.session.query(
+            ub.HiddenMagicShelfTemplate.template_key,
+            ub.HiddenMagicShelfTemplate.shelf_id
+        ).filter(
+            ub.HiddenMagicShelfTemplate.user_id == current_user.id
+        ).all()
+        hidden_shelf_templates = {item.template_key for item in hidden_items if item.template_key}
+        hidden_custom_shelf_ids = {item.shelf_id for item in hidden_items if item.shelf_id}
+
+        all_public_shelves = ub.session.query(ub.MagicShelf).filter(
+            ub.MagicShelf.is_public == 1,
+            ub.MagicShelf.user_id != current_user.id,
+            ub.MagicShelf.is_system == False
+        ).all()
+
+        hidden_custom_shelves = [s for s in all_public_shelves if s.id in hidden_custom_shelf_ids]
+        visible_public_shelves = [s for s in all_public_shelves if s.id not in hidden_custom_shelf_ids]
+
+        from .opds import (
+            get_opds_root_order_for_user,
+            get_opds_hidden_entries_for_user,
+            OPDS_ROOT_ENTRY_DEFS,
+            OPDS_ROOT_ORDER_DEFAULT,
+        )
+        opds_root_order = get_opds_root_order_for_user(current_user)
+        opds_root_order_string = ",".join(opds_root_order)
+        opds_hidden_entries = list(get_opds_hidden_entries_for_user(current_user))
+        opds_hidden_entries_string = ",".join(opds_hidden_entries)
+        opds_root_labels = [
+            {
+                "key": key,
+                "label": _(OPDS_ROOT_ENTRY_DEFS[key]['title']),
+            }
+            for key in OPDS_ROOT_ORDER_DEFAULT
+            if key in OPDS_ROOT_ENTRY_DEFS
+        ]
         return render_title_template("user_edit.html",
                                      content=current_user,
                                      config=config,
                                      translations=translations,
                                      profile=1,
                                      languages=languages,
+                                     system_shelf_templates=system_shelf_templates,
+                                     hidden_shelf_templates=hidden_shelf_templates,
+                                     hidden_custom_shelf_ids=hidden_custom_shelf_ids,
+                                     hidden_custom_shelves=hidden_custom_shelves,
+                                     visible_public_shelves=visible_public_shelves,
+                                     opds_root_order_string=opds_root_order_string,
+                                     opds_hidden_entries_string=opds_hidden_entries_string,
+                                     opds_root_labels=opds_root_labels,
                                      title=_(f"{current_user.name.capitalize()}'s Profile", name=current_user.name),
                                      page="me",
                                      kobo_support=kobo_support,
@@ -2565,6 +2663,20 @@ def profile():
     hidden_custom_shelves = [s for s in all_public_shelves if s.id in hidden_custom_shelf_ids]
     visible_public_shelves = [s for s in all_public_shelves if s.id not in hidden_custom_shelf_ids]
 
+    from .opds import get_opds_root_order_for_user, get_opds_hidden_entries_for_user, OPDS_ROOT_ENTRY_DEFS, OPDS_ROOT_ORDER_DEFAULT
+    opds_root_order = get_opds_root_order_for_user(current_user)
+    opds_root_order_string = ",".join(opds_root_order)
+    opds_hidden_entries = list(get_opds_hidden_entries_for_user(current_user))
+    opds_hidden_entries_string = ",".join(opds_hidden_entries)
+    opds_root_labels = [
+        {
+            "key": key,
+            "label": _(OPDS_ROOT_ENTRY_DEFS[key]['title'])
+        }
+        for key in OPDS_ROOT_ORDER_DEFAULT
+        if key in OPDS_ROOT_ENTRY_DEFS
+    ]
+
     return render_title_template("user_edit.html",
                                  translations=translations,
                                  profile=1,
@@ -2578,6 +2690,9 @@ def profile():
                                  hidden_custom_shelf_ids=hidden_custom_shelf_ids,
                                  hidden_custom_shelves=hidden_custom_shelves,
                                  visible_public_shelves=visible_public_shelves,
+                                 opds_root_order_string=opds_root_order_string,
+                                 opds_hidden_entries_string=opds_hidden_entries_string,
+                                 opds_root_labels=opds_root_labels,
                                  title=_(f"{current_user.name.capitalize()}'s Profile", name=current_user.name),
                                  page="me",
                                  registered_oauth=local_oauth_check,
@@ -2607,6 +2722,18 @@ def read_book(book_id, book_format):
         bookmark = ub.session.query(ub.Bookmark).filter(and_(ub.Bookmark.user_id == int(current_user.id),
                                                              ub.Bookmark.book_id == book_id,
                                                              ub.Bookmark.format == book_format.upper())).first()
+
+    kosync_progress = None
+    if current_user.is_authenticated:
+        try:
+            kobo_state = (ub.session.query(ub.KoboReadingState)
+                          .filter(ub.KoboReadingState.user_id == int(current_user.id),
+                                  ub.KoboReadingState.book_id == book_id)
+                          .first())
+            if kobo_state and kobo_state.current_bookmark:
+                kosync_progress = kobo_state.current_bookmark.progress_percent
+        except Exception as e:
+            log.debug(f"Failed to load KOReader progress for book {book_id}: {e}")
     # Track read activity
     if current_user.is_authenticated:
         try:
@@ -2642,7 +2769,8 @@ def read_book(book_id, book_format):
     
     if book_format.lower() == "epub":
         log.debug("Start epub reader for %d", book_id)
-        return render_title_template('read.html', bookid=book_id, title=book.title, bookmark=bookmark)
+        return render_title_template('read.html', bookid=book_id, title=book.title,
+                                     bookmark=bookmark, kosync_progress=kosync_progress)
     elif book_format.lower() == "pdf":
         log.debug("Start pdf reader for %d", book_id)
         return render_title_template('readpdf.html', pdffile=book_id, title=book.title)
@@ -2728,6 +2856,20 @@ def show_book(book_id):
             if media_format.format.lower() in constants.EXTENSIONS_AUDIO:
                 entry.audio_entries.append(media_format.format.lower())
 
+        kosync_progress = None
+        kosync_progress_timestamp = None
+        if current_user.is_authenticated:
+            try:
+                kobo_state = (ub.session.query(ub.KoboReadingState)
+                              .filter(ub.KoboReadingState.user_id == int(current_user.id),
+                                      ub.KoboReadingState.book_id == book_id)
+                              .first())
+                if kobo_state and kobo_state.current_bookmark:
+                    kosync_progress = kobo_state.current_bookmark.progress_percent
+                    kosync_progress_timestamp = kobo_state.current_bookmark.last_modified
+            except Exception as e:
+                log.debug(f"Failed to load KOReader progress for book {book_id}: {e}")
+
         cwa_db = CWA_DB()
         cwa_settings = cwa_db.cwa_settings
 
@@ -2738,6 +2880,8 @@ def show_book(book_id):
                                      title=entry.title,
                                      books_shelfs=book_in_shelves,
                                      cwa_settings=cwa_settings,
+                                     kosync_progress=kosync_progress,
+                                     kosync_progress_timestamp=kosync_progress_timestamp,
                                      page="book")
     else:
         log.debug("Selected book is unavailable. File does not exist or is not accessible")
